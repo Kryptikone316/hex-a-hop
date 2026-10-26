@@ -23,6 +23,12 @@
 #include "text.h"
 #include "system-relative.h"
 #include <cassert>
+#include <cstdio>
+#include <unistd.h>
+
+#include "sf3500/hwdisp.hpp"
+#include "sf3500/joykey.hpp"
+#include "debuglog.h"
 
 #ifdef WIN32
 /*	#include <SDL_syswm.h>
@@ -134,22 +140,31 @@ void InitScreen()
 		SDL_OPENGL | (fullscreen ? SDL_FULLSCREEN : 0) );
 #else
 //	printf("SDL_SetVideoMode (non-OpenGL)\n");
+	// Pinned to 16bpp (not "current") so `screen` below (SDL_DisplayFormat'd
+	// to match) is guaranteed RGB565 - hwdisp_present() needs that exact
+	// layout, and it also matches every asset already pre-converted onto
+	// `screen` elsewhere in this codebase.
 	realScreen = SDL_SetVideoMode(
 		SCREEN_W, SCREEN_H, // Width, Height
-		0, // Current BPP
+		16,
 		SDL_SWSURFACE | SDL_DOUBLEBUF | (fullscreen ? SDL_FULLSCREEN : 0) );
 #endif
 
 	if (screen)
 		SDL_FreeSurface(screen);
 
-	SDL_Surface* tempscreen = SDL_CreateRGBSurface(
-		SDL_SWSURFACE, 
+	// Not SDL_DisplayFormat(tempscreen): that needs a real video mode, and
+	// SDL_SetVideoMode above genuinely fails on real hardware (this device's
+	// actual /dev/fb0 is 480 wide, portrait-native - SCREEN_W=640 exceeds
+	// it, confirmed from a real-hardware log showing FATAL("...
+	// SDL_DisplayFormat") right after this). hwdisp_present() is the real
+	// display path regardless (see the flip code below), so `screen` never
+	// needs to match a real video surface's format - it only needs to stay
+	// the fixed RGB565 layout every blit in this codebase already assumes.
+	screen = SDL_CreateRGBSurface(
+		SDL_SWSURFACE,
 		SCREEN_W, SCREEN_H,
 		16, 0xf800, 0x07e0, 0x001f, 0);
-
-	screen = SDL_DisplayFormat(tempscreen);
-	SDL_FreeSurface(tempscreen);
 }
 
 void ToggleFullscreen()
@@ -227,8 +242,61 @@ String GetBasePath()
 #endif
 }
 
+/* Feeds the device's real gamepad (joykey) into SDL's own event queue -
+ * confirmed working on real hardware. Must be polled from the loop that
+ * actually free-runs every frame (see the call site in main()'s inner
+ * while(!SDL_PollEvent...) loop) - this device produces no real SDL
+ * events on its own (no keyboard/mouse hardware, no X11), so a copy of
+ * this call living only in an outer, event-gated loop would fire once and
+ * never again. D-pad + L1/R1 cover the 6 hex directions; L2 doubles as
+ * undo (B already does); SELECT+START is a direct failsafe exit,
+ * bypassing whatever the game's own quit path does. */
+static void PollJoykeyEvents()
+{
+	static unsigned int prev = 0;
+	unsigned int cur = joykey_read();
+
+	static const struct { int jk; SDLKey sym; } map[] = {
+		{ JK_UP,    SDLK_w },
+		{ JK_DOWN,  SDLK_s },
+		{ JK_LEFT,  SDLK_a },
+		{ JK_RIGHT, SDLK_d },
+		{ JK_L1,    SDLK_q },
+		{ JK_R1,    SDLK_e },
+		{ JK_A,     SDLK_RETURN },
+		{ JK_B,     SDLK_BACKSPACE },
+		{ JK_START, SDLK_PAUSE },
+		{ JK_L2,    SDLK_u }, // undo - matches the in-game info screen's own 'u' hint
+	};
+
+	for (unsigned int i = 0 ; i < sizeof(map)/sizeof(map[0]) ; i++)
+	{
+		unsigned int bit = 1u << map[i].jk;
+		bool was = (prev & bit) != 0;
+		bool now = (cur & bit) != 0;
+		if (now == was)
+			continue;
+
+		SDL_Event ev;
+		memset(&ev, 0, sizeof(ev));
+		ev.type = now ? SDL_KEYDOWN : SDL_KEYUP;
+		ev.key.type = ev.type;
+		ev.key.state = now ? SDL_PRESSED : SDL_RELEASED;
+		ev.key.keysym.sym = map[i].sym;
+		SDL_PushEvent(&ev);
+	}
+
+	if ((cur & (1u << JK_SELECT)) && (cur & (1u << JK_START)))
+		quitting = 1;
+
+	prev = cur;
+}
+
 int main(int /*argc*/, char * /*argv*/[])
 {
+	DebugLogInit();
+	DebugLog("main: starting");
+
 	base_path = GetBasePath();
 
 /*
@@ -241,8 +309,15 @@ int main(int /*argc*/, char * /*argv*/[])
 */
 
 	SDL_Init(SDL_INIT_VIDEO | SDL_INIT_NOPARACHUTE);
+	if (hwdisp_init() != 0)
+		DebugLog("hwdisp_init FAILED, falling back to SDL's own output");
+	joykey_init();
+
 	if (!TextInit(base_path))
+	{
+		DebugLog("TextInit FAILED, exiting");
 		return 1;
+	}
 
 	SDL_Surface* icon = SDL_LoadBMP(base_path + "/icon.bmp");
 	if (icon)
@@ -291,7 +366,6 @@ int main(int /*argc*/, char * /*argv*/[])
 	}
 
 	InitSound(base_path);
-
 	InitScreen();
 
 	SDL_WarpMouse(SCREEN_W/2, SCREEN_H/2);
@@ -307,14 +381,27 @@ int main(int /*argc*/, char * /*argv*/[])
 #endif
 	
 	StateMakerBase::GetNew();
+	DebugLog("StateMakerBase::GetNew OK, entering main loop");
 
 	while(!quitting)
 	{
 		SDL_Event e;
-		UpdateSound(-1.0);
 		while(!SDL_PollEvent(&e) && !quitting)
 		{
 			int x = 0;
+
+			// Real root cause (confirmed via debug.log during
+			// bring-up): this device generates
+			// no real SDL events at all (no keyboard/mouse hardware, no
+			// X11), so SDL_PollEvent() never returns here - this INNER
+			// loop is the only one that actually keeps iterating every
+			// frame. Calling PollJoykeyEvents()/UpdateSound() only in the
+			// OUTER loop (as originally written) meant they fired exactly
+			// once, ever, then never again - confirmed directly: the log
+			// showed one joykey read and total silence afterward, for
+			// the entire multi-minute run.
+			PollJoykeyEvents();
+			UpdateSound(-1.0);
 
 			if ((SDL_focus & 6)==6)
 			{
@@ -347,12 +434,21 @@ int main(int /*argc*/, char * /*argv*/[])
 				#ifdef USE_OPENGL
 					SDL_GL_SwapBuffers();
 				#else
-					if (screen && realScreen!=screen)
+					if (hwdisp_active())
 					{
-						SDL_Rect r = {0,0,SCREEN_W,SCREEN_H};
-						SDL_BlitSurface(screen, &r, realScreen, &r);
+						if (SDL_MUSTLOCK(screen)) SDL_LockSurface(screen);
+						hwdisp_present(screen->pixels, SCREEN_W, SCREEN_H, screen->pitch);
+						if (SDL_MUSTLOCK(screen)) SDL_UnlockSurface(screen);
 					}
-					SDL_Flip(realScreen);
+					else
+					{
+						if (screen && realScreen!=screen)
+						{
+							SDL_Rect r = {0,0,SCREEN_W,SCREEN_H};
+							SDL_BlitSurface(screen, &r, realScreen, &r);
+						}
+						SDL_Flip(realScreen);
+					}
 				#endif
 				videoExposed = 0;
 			}
@@ -520,6 +616,7 @@ int main(int /*argc*/, char * /*argv*/[])
 
 	TextFree();
 	FreeSound();
+	hwdisp_deinit();
 	SDL_Quit();
 	return 0;
 }

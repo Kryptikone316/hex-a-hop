@@ -2423,7 +2423,13 @@ struct HexPuzzle : public State
 		if (!g) FATAL("Unable to create SDL surface");
 		if (colourKey)
 			SDL_SetColorKey(g, SDL_SRCCOLORKEY, SDL_MapRGB(g->format, WATER_COLOUR));
-		SDL_Surface * out = SDL_DisplayFormat(g);
+		// Not SDL_DisplayFormat(g): that targets whatever format the real
+		// video mode ended up with, which depends on SDL_SetVideoMode
+		// having actually succeeded - it doesn't on this device (see
+		// InitScreen() in gfx.cpp). Target `screen`'s own fixed format
+		// directly instead; same conversion, no dependency on a real
+		// video surface existing at all.
+		SDL_Surface * out = SDL_ConvertSurface(g, screen->format, SDL_SWSURFACE);
 		SDL_FreeSurface(g);
 		delete [] tmp;
 		if (!out) FATAL("Unable to create SDL surface (SDL_DisplayFormat)");

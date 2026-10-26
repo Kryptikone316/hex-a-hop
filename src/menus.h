@@ -1069,7 +1069,20 @@ struct DeleteConfirmMenu : public OptMenuTitle
 		if (opt[select] == OPT_DELETE_CONFIRM)
 		{
 			GetSlotName(num, tmp);
-			remove(tmp);
+			// GetSlotName() only ever returns a bare relative name
+			// ("save2.dat") - file_open() (hex_puzzzle.cpp) redirects any
+			// "save*" file to $HOME/.hex-a-hop/ (or /tmp/ with no $HOME)
+			// before actually opening it, but remove() here was never
+			// given that same treatment - it deletes nothing because the
+			// real save lives elsewhere. Mirror file_open()'s own path
+			// resolution exactly instead of re-deleting the wrong file.
+			const char* home = getenv("HOME");
+			char real_path[PATH_MAX];
+			if (home)
+				snprintf(real_path, sizeof(real_path), "%s/.hex-a-hop/%s", home, tmp);
+			else
+				snprintf(real_path, sizeof(real_path), "/tmp/%s", tmp);
+			remove(real_path);
 		}
 		Pop();
 		Pop();
