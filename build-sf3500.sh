@@ -26,7 +26,7 @@ done
 for f in system-directory system-relative; do
   "$GCC" $CFLAGS -c "$f.c" -o "build/$f.o"
 done
-for f in hwdisp hwaudio joykey sf3500_mixer stb_vorbis_impl; do
+for f in hwdisp hwaudio joykey tfdriver sf3500_mixer stb_vorbis_impl; do
   "$GXX" $CXXFLAGS -c "sf3500/$f.cpp" -o "build/$f.o"
 done
 "$GXX" --sysroot="$SYSROOT" $ARCH build/*.o -o build/hex-a-hop.mipsel \

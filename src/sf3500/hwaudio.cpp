@@ -1,4 +1,5 @@
 #include "hwaudio.hpp"
+#include "tfdriver.hpp"
 
 #include <stdio.h>
 #include <string.h>
@@ -103,9 +104,9 @@ static int try_init(void) {
 int hwaudio_init(void) {
     if (g_active) return 0;
 
-    g_handle = dlopen("/mnt/sdcard/cubegm/driver_sf3500.so", RTLD_NOW | RTLD_GLOBAL);
+    g_handle = dlopen(tfdriver_path(), RTLD_NOW | RTLD_GLOBAL);
     if (!g_handle) {
-        fprintf(stderr, "hwaudio: dlopen failed: %s\n", dlerror());
+        fprintf(stderr, "hwaudio: dlopen %s failed: %s\n", tfdriver_path(), dlerror());
         return -1;
     }
 
